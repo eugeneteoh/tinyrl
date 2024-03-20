@@ -98,7 +98,12 @@ class QNetwork:
         self.fc3 = nn.Linear(256, 1)
 
     def __call__(self, x, a):
-        pass
+        x = Tensor.cat(x, a, dim=1)
+        x = self.fc1(x).relu()
+        x = self.fc2(x).relu()
+        x = self.fc3(x)
+        return x
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -143,6 +148,7 @@ if __name__ == "__main__":
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
+        device="cpu",
         handle_timeout_termination=False,
     )
     start_time = time.time()
@@ -153,7 +159,34 @@ if __name__ == "__main__":
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             with Tensor.inference_mode():
-                actions = actor(Tensor(obs))
+                actions = actor(Tensor(obs, dtype=dtypes.float32))
                 actions = actions + Tensor.normal(actions.shape, mean=0, std=actor.action_scale * args.exploration_noise)
                 actions = actions.numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
-                breakpoint()
+
+        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                break
+
+        real_next_obs = next_obs.copy()
+        for idx, trunc in enumerate(truncations):
+            if trunc:
+                real_next_obs[idx] = infos["final_observation"][idx]
+        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+
+        obs = next_obs
+
+        # training
+        if global_step > args.learning_starts:
+            data = rb.sample(args.batch_size)
+            next_observations = Tensor(data.next_observations.numpy(), dtype=dtypes.float32)
+            rewards = data.rewards.numpy()
+            dones = data.dones.numpy()
+            with Tensor.inference_mode():
+                next_state_actions = target_actor(next_observations)
+                qf1_next_target = qf1_target(next_observations, next_state_actions)
+                next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
