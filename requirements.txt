@@ -1,5 +1,6 @@
 git+https://github.com/tinygrad/tinygrad.git@8cb5215885e4796ada789a184e274bd7a9ba00c0
 gymnasium[mujoco]
 tyro
+tensorboard
 tensorboardX
 stable_baselines3
