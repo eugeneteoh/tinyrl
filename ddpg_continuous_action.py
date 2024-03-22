@@ -104,6 +104,13 @@ class QNetwork:
         x = self.fc3(x)
         return x
 
+def tensor_replace(tensor1, tensor2):
+    # a patch for tinygrad.Tensor.replace
+    # https://github.com/tinygrad/tinygrad/issues/3879
+    assert tensor1.shape == tensor2.shape, f"replace shape mismatch {tensor1.shape} != {tensor2.shape}"
+    tensor1.lazydata = tensor2.lazydata
+    return tensor1
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -183,10 +190,46 @@ if __name__ == "__main__":
         # training
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
+            observations = Tensor(data.observations.numpy(), dtype=dtypes.float32)
+            actions = Tensor(data.actions.numpy(), dtype=dtypes.float32)
             next_observations = Tensor(data.next_observations.numpy(), dtype=dtypes.float32)
-            rewards = data.rewards.numpy()
-            dones = data.dones.numpy()
+            rewards = Tensor(data.rewards.numpy(), dtype=dtypes.float32)
+            dones = Tensor(data.dones.numpy(), dtype=dtypes.float32)
             with Tensor.inference_mode():
                 next_state_actions = target_actor(next_observations)
                 qf1_next_target = qf1_target(next_observations, next_state_actions)
-                next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
+                next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (qf1_next_target).reshape(-1)
+
+            qf1_a_values = qf1(observations, actions).reshape(-1)
+            # mse
+            qf1_loss = (qf1_a_values - next_q_value) ** 2
+            qf1_loss = qf1_loss.mean()
+
+            q_optimizer.zero_grad()
+            qf1_loss.backward()
+            q_optimizer.step()
+
+            if global_step % args.policy_frequency == 0:
+                actor_loss = -qf1(observations, actor(observations)).mean()
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                actor_optimizer.step()
+
+                # update the target network
+                for param, target_param in zip(nn.state.get_parameters(actor), nn.state.get_parameters(target_actor)):
+                    target_param = tensor_replace(target_param, args.tau * param + (1 - args.tau) * target_param)
+                for param, target_param in zip(nn.state.get_parameters(qf1), nn.state.get_parameters(qf1_target)):
+                    target_param = tensor_replace(target_param, args.tau * param + (1 - args.tau) * target_param)
+
+            if global_step % 100 == 0:
+                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
+                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
+                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                print("SPS:", int(global_step / (time.time() - start_time)))
+                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        # TODO: Add save model functionality 
+
+    envs.close()
+    writer.close()
+
